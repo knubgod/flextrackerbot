@@ -11,18 +11,20 @@ let lastPollStartedAt = null;
 let lastPollFinishedAt = null;
 let lastPollError = null;
 
-/**
- * ------------------- EDIT THESE SETTINGS -------------------
- * Put your roster here (exact Riot IDs).
- * Example: { gameName: "Zai", tagLine: "NA1" }
- */
-const ROSTER = [
-  { gameName: "Shenanigans", tagLine: "001" },
-  { gameName: "FoURTwENTY", tagLine: "NA1" },
-  { gameName: "SurrogateShrimp", tagLine: "NA1" },
-  { gameName: "Turbooocream", tagLine: "NA1" },
-  { gameName: "Kneeco", tagLine: "4444" },
-];
+const LOCAL_ROSTER_PATH = path.join(process.cwd(), 'roster.local.json');
+
+function loadLocalRoster() {
+  if (!fs.existsSync(LOCAL_ROSTER_PATH)) return [];
+
+  try {
+    const raw = fs.readFileSync(LOCAL_ROSTER_PATH, 'utf8');
+    const data = JSON.parse(raw);
+    return Array.isArray(data) ? data : [];
+  } catch (err) {
+    console.error('Failed to load roster.local.json:', err.message);
+    return [];
+  }
+}
 
 // How many roster players must be on SAME TEAM in SAME FLEX match
 const THRESHOLD = 3;
@@ -431,8 +433,13 @@ if (fs.existsSync(commandsDir)) {
 client.once("clientReady", async () => {
   console.log(`Logged in as ${client.user.tag}`);
 
-  // Cache roster players
-  for (const p of ROSTER) {
+  // Optional local roster seeding (server-only)
+const localRoster = loadLocalRoster();
+
+if (localRoster.length > 0) {
+  console.log(`Seeding roster from roster.local.json (${localRoster.length} players)`);
+
+  for (const p of localRoster) {
     try {
       const row = await getOrCreatePlayer(p.gameName, p.tagLine);
       console.log(`Roster OK: ${row.riot_display}`);
@@ -440,6 +447,7 @@ client.once("clientReady", async () => {
       console.error(`Roster failed for ${p.gameName}#${p.tagLine}: ${e.message}`);
     }
   }
+}
 
   let DDRAGON_VERSION = null;
 

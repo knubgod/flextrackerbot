@@ -4,3 +4,4 @@ bot.db
 *.log
 pm2*.log
 .DS_Store
+roster.local.json
