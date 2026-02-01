@@ -7,10 +7,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-let lastPollStartedAt = null;
-let lastPollFinishedAt = null;
-let lastPollError = null;
-
 /**
  * ------------------- EDIT THESE SETTINGS -------------------
  * Put your roster here (exact Riot IDs).
@@ -38,8 +34,8 @@ const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const RIOT_API_KEY = process.env.RIOT_API_KEY;
 const ALERT_CHANNEL_ID = process.env.ALERT_CHANNEL_ID;
 
-if (!DISCORD_TOKEN || !RIOT_API_KEY) {
-  console.error("Missing .env values. Need DISCORD_TOKEN, RIOT_API_KEY");
+if (!DISCORD_TOKEN || !RIOT_API_KEY || !ALERT_CHANNEL_ID) {
+  console.error("Missing .env values. Need DISCORD_TOKEN, RIOT_API_KEY, ALERT_CHANNEL_ID");
   process.exit(1);
 }
 
@@ -398,11 +394,7 @@ client.on('interactionCreate', async (interaction) => {
     getEffectiveConfig,
     // manual record helpers
     addManualRecord,
-    setManualRecord,
-    getLastPollStartedAt: () => lastPollStartedAt,
-    getLastPollFinishedAt: () => lastPollFinishedAt,
-    getLastPollError: () => lastPollError,
-
+    setManualRecord
   };
 
   try {
@@ -428,7 +420,7 @@ if (fs.existsSync(commandsDir)) {
   }
 }
 
-client.once("clientReady", async () => {
+client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
 
   // Cache roster players
@@ -441,37 +433,19 @@ client.once("clientReady", async () => {
     }
   }
 
-  let DDRAGON_VERSION = null;
-
-async function getDdragonVersion() {
-  if (DDRAGON_VERSION) return DDRAGON_VERSION;
-
-  const res = await request("https://ddragon.leagueoflegends.com/api/versions.json");
-  const versions = await res.body.json();
-
-  DDRAGON_VERSION = versions?.[0] || "14.1.1";
-  return DDRAGON_VERSION;
-}
-
-
    // Main loop (dynamic poll interval)
   const loop = async () => {
-  while (true) {
-    lastPollStartedAt = Date.now();
-    lastPollError = null;
+    while (true) {
+      try {
+        await pollOnce();
+      } catch (e) {
+        console.error("Poll error:", e.message);
+      }
 
-    try {
-      await pollOnce();
-      lastPollFinishedAt = Date.now();
-    } catch (e) {
-      lastPollError = e?.message || String(e);
-      console.error("Poll error:", lastPollError);
+      const { pollMs } = getEffectiveConfig();
+      await new Promise(resolve => setTimeout(resolve, pollMs));
     }
-
-    const { pollMs } = getEffectiveConfig();
-    await new Promise(resolve => setTimeout(resolve, pollMs));
-  }
-};
+  };
 
   loop(); // do NOT await
 });
@@ -521,6 +495,17 @@ if (!hasStackMatchRow(gameId)) {
     s => `• [${s.riot_display}](${opggSummonerUrl(s.riot_display)})`
   );
 
+  const embed = new EmbedBuilder()
+    .setTitle(`Flex stack detected (${stack.length})`)
+    .setDescription(opggLines.join("\n"))
+    .addFields(
+      { name: "Queue", value: "Ranked Flex (440)", inline: true },
+      { name: "Game ID", value: String(gameId), inline: true },
+      { name: "Note", value: "Posting result after the match ends.", inline: false }
+    )
+    .setTimestamp();
+
+  await postEmbed(client, embed);
 }
 
 
@@ -577,52 +562,22 @@ if (!hasStackMatchRow(gameId)) {
     insertPlayerResults(matchId, rosterTeamParticipants);
 
     const record = getTeamStackRecord();
-    const wins = record.total.wins;
-    const losses = record.total.losses;
 
-    // Summary embed (match-level)
-    const summary = new EmbedBuilder()
+    const lines = match.info.participants
+      .filter(p => rosterPuuids.has(p.puuid) && p.teamId === teamId)
+      .map(p => `• **${puuidToDisplay.get(p.puuid) || p.summonerName}** — ${p.championName} — ${p.kills}/${p.deaths}/${p.assists}`);
+
+    const embed = new EmbedBuilder()
       .setTitle(`Flex stack finished: ${win ? "WIN" : "LOSS"}`)
+      .setDescription(lines.join("\n") || "Could not match roster players in participants.")
       .addFields(
         { name: "Stack size", value: String(row.stack_size), inline: true },
-        { name: "All-time stack record", value: `${wins}-${losses}`, inline: true },
+        { name: "All-time stack record", value: `${record.wins}-${record.losses}`, inline: true },
         { name: "Match ID", value: matchId, inline: false }
       )
       .setTimestamp();
 
-    // One embed per roster player (champ icon thumbnail)
-    const ddragonVersion = await getDdragonVersion();
-
-    const playerEmbeds = match.info.participants
-      .filter(p => rosterPuuids.has(p.puuid) && p.teamId === teamId)
-      .map(p => {
-        const riotDisplay = puuidToDisplay.get(p.puuid) || p.summonerName;
-        const opgg = opggSummonerUrl(riotDisplay);
-
-        const champIconUrl =
-          `https://ddragon.leagueoflegends.com/cdn/${ddragonVersion}/img/champion/${p.championName}.png`;
-
-        return new EmbedBuilder()
-          .setTitle(riotDisplay)
-          .setURL(opgg)
-          .setThumbnail(champIconUrl)
-          .addFields(
-            { name: "Champion", value: p.championName, inline: true },
-            { name: "K/D/A", value: `${p.kills}/${p.deaths}/${p.assists}`, inline: true }
-          );
-      });
-
-    await postEmbeds(client, [summary, ...playerEmbeds]);
-
-    async function postEmbeds(client, embeds) {
-  const { alertChannelId } = getEffectiveConfig();
-  if (!alertChannelId) throw new Error("No alert channel configured (set ALERT_CHANNEL_ID in .env or /config set-alert-channel)");
-
-  const channel = await client.channels.fetch(alertChannelId);
-  if (!channel?.isTextBased()) throw new Error("Configured alert channel is not a text channel");
-  await channel.send({ embeds });
-}
-
+    await postEmbed(client, embed);
 
     removeActiveGame(row.game_id);
   }
