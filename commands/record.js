@@ -16,5 +16,5 @@ export async function execute(interaction, ctx) {
     )
     .setFooter({ text: 'Auto = only games detected live by the bot (3+ stack in Flex).' });
 
-  await interaction.reply({ embeds: [embed], ephemeral: true });
+  await interaction.reply({ embeds: [embed] });
 }
