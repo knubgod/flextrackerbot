@@ -29,6 +29,36 @@ The bot is designed for **small private Discord servers** and conservative Riot 
 
 ---
 
+## Example Output & User Flow
+
+Below are example screenshots showing how Flex Tracker is used in a Discord server.
+
+### Stack detected (in-progress game)
+When multiple roster members queue Ranked Flex together, the bot detects the stack.
+![Flex stack detected](screenshots/stack_detected.png)
+
+### Match result summary
+After the match finishes, the bot posts a summary with the result and player stats.
+![Match finished summary](screenshots/match_result.png)
+
+### Team record command
+Displays the current stacked Flex win/loss record.
+![Record command](screenshots/command_record.png)
+
+### Bot status command
+Shows bot health, polling status, and last check information.
+![Status command](screenshots/command_status.png)
+
+### Roster management
+Lists the currently configured roster of Riot IDs.
+![Roster list command](screenshots/command_roster_list.png)
+
+### Help command
+Shows available commands and basic usage information.
+![Help command](screenshots/command_help.png)
+
+---
+
 ## Requirements
 
 - **Node.js 20+**
