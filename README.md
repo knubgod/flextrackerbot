@@ -1,190 +1,188 @@
-# Clash Tracker Discord Bot (Ranked Flex Stack Alerts)
+# Flex Tracker Discord Bot  
+*Ranked Flex stack detection & match tracking*
 
-A Discord bot that monitors a roster of League of Legends players and posts alerts when **3+ roster players** are detected **stacked together on the same team in Ranked Flex (queue 440)**. It also tracks a stacked Flex **win/loss record** and supports **manual adjustments** for games played while the bot was offline.
+Flex Tracker is a **self-hosted Discord bot** that monitors a roster of League of Legends players and posts alerts when **3 or more roster members queue Ranked Flex together on the same team (queue ID 440)**.  
+It also tracks **team win/loss records** and supports **manual adjustments** for games played while the bot was offline.
+
+The bot is designed for **small private Discord servers** and conservative Riot API usage.
 
 ---
 
 ## Features
 
-- Detects **Ranked Flex (440)** games with **N+ roster players** on the same team (default threshold: 3).
-- Posts to a configurable Discord channel:
-  - **“Flex stack detected”** (when found in-progress)
-  - **“Flex stack finished: WIN/LOSS”** (after the match ends)
-- Tracks records in SQLite:
-  - **Auto record**: matches detected by the bot
-  - **Manual record**: adjustments via commands
-  - **Total record**: auto + manual
-- Roster management via slash commands (no code edits required).
-- Server configuration via slash commands (no code edits required):
-  - alert channel
-  - threshold
-  - polling interval
+- Detects Ranked Flex (queue 440) games with **N+ roster players** on the same team  
+  - Default threshold: **3**
+- Automatically posts to a configurable Discord channel:
+  - Stack detected (in-progress game)
+  - Stack finished (WIN / LOSS)
+- Match summaries include:
+  - Champion played
+  - K/D/A
+  - Match ID
+  - External profile links (OP.GG)
+- Persistent SQLite storage:
+  - **Auto record** – games detected by the bot
+  - **Manual record** – admin adjustments
+  - **Total record** – combined
+- Full roster and configuration management via **Discord slash commands**
+- No code edits required after setup
 
 ---
 
 ## Requirements
 
-- Node.js **20+** recommended (works with newer versions too)
+- **Node.js 20+**
+- **npm**
 - A Discord application + bot token
-- A Riot API key (Riot Developer Portal)
-- Discord server permissions to invite the bot (Manage Server recommended)
+- A Riot Games API key
+- A Discord server where you have admin permissions
+
+Flex Tracker is intentionally **self-hosted**. Each server owner runs their own instance.
 
 ---
 
-### 🚀 Getting Started
-Prerequisites
+## Getting Started
 
-Before running Flex Tracker, you will need:
+### 1. Clone the repository
 
-Node.js 20+
-
-npm
-
-A Discord bot application
-
-A Riot Games API key
-
-A Discord server where you have admin permissions
-
-Flex Tracker is designed to be self-hosted. Each user or server owner runs their own instance.
-
-Installation
-1. Clone the repository
+```bash
 git clone https://github.com/knubgod/flextrackerbot.git
 cd flextrackerbot
+```
 
-2. Install dependencies
+### 2. Install dependencies
+
+```bash
 npm install
+```
 
-Configuration
-3. Create a .env file
+### 3. Create a `.env` file
 
-Create a .env file in the project root:
+In the project root, create a file named `.env`:
 
+```env
 DISCORD_TOKEN=your_discord_bot_token
 RIOT_API_KEY=your_riot_api_key
 OWNER_USER_ID=your_discord_user_id
+```
 
+⚠️ **Never commit your `.env` file.**  
+It is intentionally ignored by Git.
 
-⚠️ Never commit your .env file. It is intentionally ignored by Git.
+---
 
-4. (Optional) Local roster seeding
+### 4. (Optional) Local roster seeding
 
-For convenience, server owners may optionally create a local file named:
+You may optionally create a local file named:
 
+```
 roster.local.json
-
+```
 
 Example:
 
+```json
 [
   { "gameName": "PlayerOne", "tagLine": "NA1" },
   { "gameName": "PlayerTwo", "tagLine": "NA1" }
 ]
+```
 
+Notes:
+- This file is **not required**
+- It is **not tracked by Git**
+- It allows the bot to preload a roster on startup
+- Rosters can always be managed later via Discord commands
 
-This file is not required
+---
 
-It is not tracked by Git
+### 5. Run the bot
 
-It allows the bot to auto-load a roster on startup
-
-Rosters can always be managed later via Discord commands
-
-Running the bot
-5. Start the bot
+```bash
 node index.js
+```
 
+For production use, a process manager such as **PM2** is recommended:
 
-For production use, a process manager such as PM2 is recommended:
-
+```bash
 pm2 start index.js --name flex-tracker
 pm2 save
+```
 
-# Discord Setup
+---
+
+## Discord Setup
 
 Invite the bot to your server with:
+- `bot`
+- `applications.commands`
 
-applications.commands
+Once invited, use slash commands to:
+- Set the alert channel
+- Add or remove roster members
+- View records and bot status
+- Adjust thresholds and polling behavior
 
-bot permissions
+After configuration, the bot will automatically:
+- Detect Ranked Flex stacks
+- Track active matches
+- Post match results when games finish
 
-Use slash commands to configure the bot:
+---
 
-Set alert channel
+## Responsible API Usage
 
-Add/remove roster members
+Flex Tracker is designed with **Riot Games API policies and rate limits** in mind.
 
-View records and status
+### APIs Used
 
-Once configured, the bot will automatically:
+Flex Tracker uses only the following Riot APIs:
+- **Spectator API** – detect active Ranked Flex games
+- **Match API** – retrieve completed match data
+- **Account API** – resolve Riot IDs to PUUIDs
 
-Detect Ranked Flex stacks
+No other Riot APIs are accessed.
 
-Track matches
+---
 
-Post results when games finish
+### Rate Limiting & Polling
 
-🔐 Responsible API Usage
+- Default polling interval: **60 seconds**
+- Polling frequency is configurable but intentionally conservative
+- API requests are limited to configured roster members only
+- The bot does **not** scan arbitrary players or public match histories
+- Local caching is used to reduce unnecessary repeat requests
 
-Flex Tracker is designed with Riot Games API policies and rate limits in mind.
+---
 
-# API Usage Overview
+### Data Handling & Privacy
 
-Flex Tracker uses the following Riot APIs:
+- No personal data is collected beyond publicly available match statistics
+- All data is stored locally in a SQLite database owned by the server operator
+- No data is transmitted to third parties
+- No analytics, tracking, or monetization is performed
 
-Spectator API – to detect active Ranked Flex games
+---
 
-Match API – to retrieve completed match data
-
-Account API – to resolve Riot IDs to PUUIDs
-
-No other Riot APIs are used.
-
-# Rate Limiting & Polling
-
-The bot polls at a configurable interval (default: 60 seconds)
-
-Polling frequency is intentionally conservative to avoid rate limit abuse
-
-API calls are limited to roster members only
-
-The bot does not scan arbitrary players or public match histories
-
-Data Handling & Privacy
-
-No personal data is collected beyond publicly available match statistics
-
-All data is stored locally in a SQLite database owned by the server operator
-
-No data is transmitted to third parties
-
-No analytics, tracking, or monetization is performed
-
-Scope & Intended Use
+### Scope & Intended Use
 
 Flex Tracker is intended for:
+- Small friend groups
+- Amateur Ranked Flex teams
+- Private Discord servers
 
-Small groups
+The bot **does not**:
+- Provide coaching or gameplay advice
+- Automate gameplay
+- Perform matchmaking manipulation
+- Support betting or gambling
+- Scrape, resell, or aggregate Riot data
 
-Friend teams
+---
 
-Amateur Ranked Flex players
+## Compliance Statement
 
-Private Discord servers
+Flex Tracker is a **non-commercial, community-built project** and is not affiliated with or endorsed by Riot Games.
 
-The bot:
-
-❌ Does not provide coaching advice
-
-❌ Does not automate gameplay
-
-❌ Does not perform matchmaking manipulation
-
-❌ Does not support betting or gambling
-
-❌ Does not scrape or resell data
-
-##### Compliance Statement
-
-Flex Tracker is a non-commercial, community-built tool and is not affiliated with or endorsed by Riot Games. All Riot Games trademarks and assets are the property of Riot Games, Inc.
+League of Legends and Riot Games are trademarks or registered trademarks of Riot Games, Inc.  
+All assets and trademarks belong to their respective owners.
