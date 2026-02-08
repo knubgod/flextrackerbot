@@ -131,6 +131,27 @@ async function riotGet(url) {
   return res.body.json();
 }
 
+let DDRAGON_VERSION = null;
+
+async function getDdragonVersion() {
+  if (DDRAGON_VERSION) return DDRAGON_VERSION;
+
+  try {
+    const res = await request("https://ddragon.leagueoflegends.com/api/versions.json");
+    if (res.statusCode < 200 || res.statusCode >= 300) {
+      throw new Error(`DDragon returned ${res.statusCode}`);
+    }
+
+    const versions = await res.body.json();
+    DDRAGON_VERSION = versions?.[0] || "14.1.1";
+  } catch (err) {
+    DDRAGON_VERSION = "14.1.1";
+    console.warn(`Falling back to DDragon ${DDRAGON_VERSION}: ${err.message}`);
+  }
+
+  return DDRAGON_VERSION;
+}
+
 function canEditRecord(interaction) {
   const ownerId = process.env.OWNER_USER_ID;
   const isOwner = ownerId && interaction.user?.id === ownerId;
@@ -449,19 +470,6 @@ if (localRoster.length > 0) {
   }
 }
 
-  let DDRAGON_VERSION = null;
-
-async function getDdragonVersion() {
-  if (DDRAGON_VERSION) return DDRAGON_VERSION;
-
-  const res = await request("https://ddragon.leagueoflegends.com/api/versions.json");
-  const versions = await res.body.json();
-
-  DDRAGON_VERSION = versions?.[0] || "14.1.1";
-  return DDRAGON_VERSION;
-}
-
-
    // Main loop (dynamic poll interval)
   const loop = async () => {
   while (true) {
@@ -524,12 +532,21 @@ async function pollOnce() {
       const detectedAt = Date.now();
 
       // Announce once
-if (!hasStackMatchRow(gameId)) {
-  const opggLines = stack.map(
-    s => `• [${s.riot_display}](${opggSummonerUrl(s.riot_display)})`
-  );
+      if (!hasStackMatchRow(gameId)) {
+        const opggLines = stack.map(
+          s => `• [${s.riot_display}](${opggSummonerUrl(s.riot_display)})`
+        );
+        const started = new EmbedBuilder()
+          .setTitle(`Flex stack detected (${stack.length})`)
+          .setDescription(opggLines.join("\n"))
+          .addFields(
+            { name: "Game ID", value: String(gameId), inline: true },
+            { name: "Team ID", value: String(teamId), inline: true }
+          )
+          .setTimestamp();
 
-}
+        await postEmbed(client, started);
+      }
 
 
       // Watch it for completion + persist start
