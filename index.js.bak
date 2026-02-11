@@ -10,14 +10,14 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 /**
  * ------------------- EDIT THESE SETTINGS -------------------
  * Put your roster here (exact Riot IDs).
- * Example: { gameName: "Zai", tagLine: "NA1" }
+ * Example: { gameName: "AhriLover12", tagLine: "NA1" }
  */
 const ROSTER = [
-  { gameName: "Shenanigans", tagLine: "001" },
-  { gameName: "FoURTwENTY", tagLine: "NA1" },
-  { gameName: "SurrogateShrimp", tagLine: "NA1" },
-  { gameName: "Turbooocream", tagLine: "NA1" },
-  { gameName: "Kneeco", tagLine: "4444" },
+  { gameName: "Player 1", tagLine: "NA1" },
+  { gameName: "Player 2", tagLine: "NA1" },
+  { gameName: "Player 3", tagLine: "NA1" },
+  { gameName: "Player 4", tagLine: "NA1" },
+  { gameName: "Player 5", tagLine: "NA1" },
 ];
 
 // How many roster players must be on SAME TEAM in SAME FLEX match
@@ -584,3 +584,4 @@ if (!hasStackMatchRow(gameId)) {
 }
 
 client.login(DISCORD_TOKEN);
+
