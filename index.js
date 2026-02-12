@@ -59,11 +59,14 @@ const REGIONAL_HOST = "https://americas.api.riotgames.com"; // account-v1 + matc
 const FLEX_QUEUE_ID = 440; // Ranked Flex SR
 
 /* =========================================================
-   [SECTION] SQLite DB + schema + migrations
+   [SECTION] SQLite DB + base schema + migrations
    ========================================================= */
 const db = new Database("bot.db");
 
-// Base schema (existing tables)
+/**
+ * Base schema (tables that existed before stats upgrades)
+ * FIX NOTE: This block should be safe to run on every startup.
+ */
 db.exec(`
 CREATE TABLE IF NOT EXISTS players (
   riot_id TEXT PRIMARY KEY,
@@ -121,20 +124,28 @@ CREATE TABLE IF NOT EXISTS global_config (
 INSERT OR IGNORE INTO global_config (id, active_guild_id, poll_ms) VALUES (1, NULL, 60000);
 `);
 
-// --- Migrations for v1.2.0 stats ---
+/**
+ * --- Migrations for v1.2.0+ stats ---
+ * FIX NOTE: Your crash came from creating an index on a column that didn't exist.
+ * We now:
+ *  1) add stack_matches.side (if missing)
+ *  2) ensure enemy_champ_results exists
+ *  3) ensure team_champ_results exists AND has champ column (ALTER if needed)
+ *  4) create indexes only AFTER the columns exist
+ */
 function ensureMigrations() {
   // Add side column to stack_matches (BLUE/RED)
   try {
     db.exec(`ALTER TABLE stack_matches ADD COLUMN side TEXT`);
     console.log("[db] Migration: added stack_matches.side");
   } catch (e) {
-      if (!String(e.message).includes("duplicate column name")) {
-        console.warn("[db] Migration warning:", e.message);
-      }
     // "duplicate column name" is fine
+    if (!String(e.message).includes("duplicate column name")) {
+      console.warn("[db] Migration warning:", e.message);
+    }
   }
 
-  // Create enemy champ tracking table
+  // Enemy champ tracking table (used by /stats)
   db.exec(`
     CREATE TABLE IF NOT EXISTS enemy_champ_results (
       match_id TEXT NOT NULL,
@@ -144,8 +155,44 @@ function ensureMigrations() {
     );
   `);
 
+  // Team champ tracking table (used by /statsdetailed and /statsfive)
+  // FIX NOTE: This is the correct schema. (Your prior version was missing champ + had type typos.)
   db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_enemy_champ_results_champ ON enemy_champ_results(champ);`);
+    CREATE TABLE IF NOT EXISTS team_champ_results (
+      match_id TEXT NOT NULL,
+      puuid TEXT NOT NULL,
+      champ TEXT,
+      win INTEGER NOT NULL,
+      stack_size INTEGER NOT NULL,
+      side TEXT,
+      PRIMARY KEY (match_id, puuid)
+    );
+  `);
+
+  // If team_champ_results existed from a broken migration, it may not have champ.
+  // We detect and add it.
+  try {
+    const cols = db.prepare(`PRAGMA table_info(team_champ_results)`).all();
+    const hasChamp = cols.some((c) => c.name === "champ");
+    if (!hasChamp) {
+      db.exec(`ALTER TABLE team_champ_results ADD COLUMN champ TEXT`);
+      console.log("[db] Migration: added team_champ_results.champ");
+    }
+  } catch (e) {
+    console.warn("[db] Migration warning (team_champ_results pragma/alter):", e.message);
+  }
+
+  // Helpful indexes (safe to run every startup)
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_enemy_champ_results_champ
+    ON enemy_champ_results(champ);
+  `);
+
+  // FIX NOTE: This one caused your crash before. It's safe now because champ exists.
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_team_champ_results_champ
+    ON team_champ_results(champ);
+  `);
 }
 
 ensureMigrations();
@@ -325,7 +372,7 @@ function insertPlayerResults(matchId, results) {
   tx();
 }
 
-// New for /stats: track “vs enemy champions” results per match
+// Track “vs enemy champions” results per match
 function insertEnemyChampResults(matchId, enemyChamps, win) {
   const stmt = db.prepare(`
     INSERT OR IGNORE INTO enemy_champ_results (match_id, champ, win)
@@ -334,6 +381,23 @@ function insertEnemyChampResults(matchId, enemyChamps, win) {
 
   const tx = db.transaction(() => {
     for (const champ of enemyChamps) stmt.run(matchId, champ, win ? 1 : 0);
+  });
+
+  tx();
+}
+
+// Track roster players’ champs for team performance stats
+function insertTeamChampResults(matchId, rows) {
+  const stmt = db.prepare(`
+    INSERT OR REPLACE INTO team_champ_results
+      (match_id, puuid, champ, win, stack_size, side)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+
+  const tx = db.transaction(() => {
+    for (const r of rows) {
+      stmt.run(matchId, r.puuid, r.champ, r.win ? 1 : 0, r.stack_size, r.side);
+    }
   });
 
   tx();
@@ -453,6 +517,16 @@ function didTeamWin(match, teamId) {
   return !!t?.win;
 }
 
+/**
+ * FIX NOTE: Use this helper everywhere so we never duplicate side logic
+ * or accidentally typo teamId/teamID again.
+ */
+function getSideFromTeamId(teamId) {
+  if (teamId === 100) return "BLUE";
+  if (teamId === 200) return "RED";
+  return null;
+}
+
 function hasStackMatchRow(gameId) {
   return !!db.prepare("SELECT game_id FROM stack_matches WHERE game_id = ?").get(String(gameId));
 }
@@ -501,7 +575,7 @@ client.on("interactionCreate", async (interaction) => {
 
   // Context passed to every command module
   const ctx = {
-    db, // <-- REQUIRED for /stats
+    db, // REQUIRED for stats commands
     pollOnce,
     getTeamStackRecord,
 
@@ -534,7 +608,6 @@ client.on("interactionCreate", async (interaction) => {
   };
 
   try {
-    if (interaction.commandName === "stats") console.log("[debug] stats ctx keys:", Object.keys(ctx));
     await cmd.execute(interaction, ctx);
   } catch (e) {
     console.error("Command error:", e);
@@ -603,7 +676,7 @@ client.once("clientReady", async () => {
    - detects live stacks
    - tracks completion
    - posts final embeds
-   - writes stats for /stats
+   - writes stats for /stats, /statsdetailed, /statsfive
    ========================================================= */
 async function pollOnce() {
   console.log(`[poll] ${new Date().toLocaleTimeString()} checking roster...`);
@@ -689,9 +762,7 @@ async function pollOnce() {
     const { matchId, match } = done;
     const teamId = Number(row.team_id);
     const win = didTeamWin(match, teamId) ? 1 : 0;
-
-    // Side: teamId 100 = BLUE, teamId 200 = RED
-    const side = teamId === 100 ? "BLUE" : teamId === 200 ? "RED" : null;
+    const side = getSideFromTeamId(teamId);
 
     // Store player results
     const rosterTeamParticipants = match.info.participants
@@ -714,7 +785,21 @@ async function pollOnce() {
 
     insertPlayerResults(matchId, rosterTeamParticipants);
 
-    // NEW: track enemy champs for /stats
+    // Store roster players' champs for this match (team performance stats)
+    // FIX NOTE: your old code used p.teamID (wrong). It must be p.teamId.
+    const teamChampRows = match.info.participants
+      .filter((p) => rosterPuuids.has(p.puuid) && p.teamId === teamId)
+      .map((p) => ({
+        puuid: p.puuid,
+        champ: p.championName,
+        win: Boolean(win),
+        stack_size: Number(row.stack_size),
+        side,
+      }));
+
+    insertTeamChampResults(matchId, teamChampRows);
+
+    // Track enemy champs for /stats*
     const enemyChamps = match.info.participants
       .filter((p) => p.teamId !== teamId)
       .map((p) => p.championName);
