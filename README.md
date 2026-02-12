@@ -8,6 +8,17 @@ The bot is designed for **small private Discord servers** and conservative Riot 
 
 ---
 
+## Version
+
+Current release: **v1.2.2**
+
+### What’s new in v1.2.2
+- Expanded stats support (team-side + champion tracking groundwork for detailed stats commands).
+- Fixed a startup crash caused by a SQLite migration/index mismatch (`no such column: champ`).
+- Improved migrations to safely create/patch tables without breaking existing installs.
+
+---
+
 ## Features
 
 - Detects Ranked Flex (queue 440) games with **N+ roster players** on the same team  
@@ -172,6 +183,13 @@ Flex Tracker uses only the following Riot APIs:
 - **Account API** – resolve Riot IDs to PUUIDs
 
 No other Riot APIs are accessed.
+
+---
+
+### Database & migrations
+Flex Tracker stores data locally in `bot.db` (SQLite).  
+On startup, the bot may run safe migrations to add new columns/tables needed for newer versions.
+If you upgrade versions, **do not delete `bot.db`** unless you intentionally want to reset stats/records.
 
 ---
 
