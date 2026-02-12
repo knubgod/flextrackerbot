@@ -1,57 +1,69 @@
-import 'dotenv/config';
-import { Client, GatewayIntentBits, EmbedBuilder } from 'discord.js';
-import { request } from 'undici';
-import Database from 'better-sqlite3';
+import "dotenv/config";
+import { Client, GatewayIntentBits, EmbedBuilder } from "discord.js";
+import { request } from "undici";
+import Database from "better-sqlite3";
 
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
+/* =========================================================
+   [SECTION] Runtime health metrics (used by /status)
+   ========================================================= */
 let lastPollStartedAt = null;
 let lastPollFinishedAt = null;
 let lastPollError = null;
 
-const LOCAL_ROSTER_PATH = path.join(process.cwd(), 'roster.local.json');
+/* =========================================================
+   [SECTION] Optional local roster seeding (server-only)
+   - This file is not committed to Git
+   - Lets you keep your personal roster without hardcoding it
+   ========================================================= */
+const LOCAL_ROSTER_PATH = path.join(process.cwd(), "roster.local.json");
 
 function loadLocalRoster() {
   if (!fs.existsSync(LOCAL_ROSTER_PATH)) return [];
 
   try {
-    const raw = fs.readFileSync(LOCAL_ROSTER_PATH, 'utf8');
+    const raw = fs.readFileSync(LOCAL_ROSTER_PATH, "utf8");
     const data = JSON.parse(raw);
     return Array.isArray(data) ? data : [];
   } catch (err) {
-    console.error('Failed to load roster.local.json:', err.message);
+    console.error("Failed to load roster.local.json:", err.message);
     return [];
   }
 }
 
-// How many roster players must be on SAME TEAM in SAME FLEX match
-const THRESHOLD = 3;
+/* =========================================================
+   [SECTION] Defaults (DB config can override these)
+   ========================================================= */
+const DEFAULT_THRESHOLD = 3;
+const DEFAULT_POLL_MS = 60_000;
 
-// Poll interval (ms). 60s is a safe starting point for Riot rate limits.
-const POLL_MS = 60_000;
-
-/**
- * -----------------------------------------------------------
- */
-
+/* =========================================================
+   [SECTION] Environment variables
+   ========================================================= */
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const RIOT_API_KEY = process.env.RIOT_API_KEY;
-const ALERT_CHANNEL_ID = process.env.ALERT_CHANNEL_ID;
 
 if (!DISCORD_TOKEN || !RIOT_API_KEY) {
   console.error("Missing .env values. Need DISCORD_TOKEN, RIOT_API_KEY");
   process.exit(1);
 }
 
-// Riot routing (NA)
-const PLATFORM_HOST = "https://na1.api.riotgames.com";      // spectator/summoner endpoints
+/* =========================================================
+   [SECTION] Riot routing + constants
+   ========================================================= */
+const PLATFORM_HOST = "https://na1.api.riotgames.com"; // spectator endpoints
 const REGIONAL_HOST = "https://americas.api.riotgames.com"; // account-v1 + match-v5
 const FLEX_QUEUE_ID = 440; // Ranked Flex SR
 
-// SQLite DB (persists wins/losses)
+/* =========================================================
+   [SECTION] SQLite DB + schema + migrations
+   ========================================================= */
 const db = new Database("bot.db");
+
+// Base schema (existing tables)
 db.exec(`
 CREATE TABLE IF NOT EXISTS players (
   riot_id TEXT PRIMARY KEY,
@@ -109,10 +121,38 @@ CREATE TABLE IF NOT EXISTS global_config (
 INSERT OR IGNORE INTO global_config (id, active_guild_id, poll_ms) VALUES (1, NULL, 60000);
 `);
 
-function riotIdKey(gameName, tagLine) {
-  return `${gameName}#${tagLine}`.toLowerCase();
+// --- Migrations for v1.2.0 stats ---
+function ensureMigrations() {
+  // Add side column to stack_matches (BLUE/RED)
+  try {
+    db.exec(`ALTER TABLE stack_matches ADD COLUMN side TEXT`);
+    console.log("[db] Migration: added stack_matches.side");
+  } catch (e) {
+      if (!String(e.message).includes("duplicate column name")) {
+        console.warn("[db] Migration warning:", e.message);
+      }
+    // "duplicate column name" is fine
+  }
+
+  // Create enemy champ tracking table
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS enemy_champ_results (
+      match_id TEXT NOT NULL,
+      champ TEXT NOT NULL,
+      win INTEGER NOT NULL,
+      PRIMARY KEY (match_id, champ)
+    );
+  `);
+
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_enemy_champ_results_champ ON enemy_champ_results(champ);`);
 }
 
+ensureMigrations();
+
+/* =========================================================
+   [SECTION] Riot HTTP helper
+   ========================================================= */
 async function riotGet(url) {
   const res = await request(url, { headers: { "X-Riot-Token": RIOT_API_KEY } });
 
@@ -131,6 +171,9 @@ async function riotGet(url) {
   return res.body.json();
 }
 
+/* =========================================================
+   [SECTION] Data Dragon version cache (champ icons)
+   ========================================================= */
 let DDRAGON_VERSION = null;
 
 async function getDdragonVersion() {
@@ -141,7 +184,6 @@ async function getDdragonVersion() {
     if (res.statusCode < 200 || res.statusCode >= 300) {
       throw new Error(`DDragon returned ${res.statusCode}`);
     }
-
     const versions = await res.body.json();
     DDRAGON_VERSION = versions?.[0] || "14.1.1";
   } catch (err) {
@@ -152,19 +194,27 @@ async function getDdragonVersion() {
   return DDRAGON_VERSION;
 }
 
+/* =========================================================
+   [SECTION] Permissions + URLs
+   ========================================================= */
 function canEditRecord(interaction) {
   const ownerId = process.env.OWNER_USER_ID;
   const isOwner = ownerId && interaction.user?.id === ownerId;
-  const isAdmin = interaction.memberPermissions?.has('Administrator');
+  const isAdmin = interaction.memberPermissions?.has("Administrator");
   return Boolean(isOwner || isAdmin);
 }
 
 function opggSummonerUrl(riotDisplay) {
-  // riotDisplay like "FoURTwENTY#NA1"
-  const [gameName, tagLine] = riotDisplay.split('#');
-  // OP.GG uses URL encoding; format is generally /<GameName>-<TagLine>
-  const slug = `${gameName}-${tagLine}`.replace(/\s+/g, '%20');
+  const [gameName, tagLine] = riotDisplay.split("#");
+  const slug = `${gameName}-${tagLine}`.replace(/\s+/g, "%20");
   return `https://www.op.gg/lol/summoners/na/${slug}`;
+}
+
+/* =========================================================
+   [SECTION] Player / roster helpers
+   ========================================================= */
+function riotIdKey(gameName, tagLine) {
+  return `${gameName}#${tagLine}`.toLowerCase();
 }
 
 async function getOrCreatePlayer(gameName, tagLine) {
@@ -177,15 +227,11 @@ async function getOrCreatePlayer(gameName, tagLine) {
 
   if (row) return row;
 
-  // Riot ID -> PUUID (global)
   const acct = await riotGet(
     `${REGIONAL_HOST}/riot/account/v1/accounts/by-riot-id/${encodeURIComponent(gameName)}/${encodeURIComponent(tagLine)}`
   );
   if (!acct?.puuid) throw new Error(`Could not find Riot ID: ${display}`);
 
-  // IMPORTANT:
-  // Summoner-V4 may not return "id" with dev keys right now,
-  // so we store the PUUID into summoner_id just to satisfy the NOT NULL schema.
   db.prepare(
     "INSERT OR REPLACE INTO players (riot_id, riot_display, puuid, summoner_id) VALUES (?, ?, ?, ?)"
   ).run(key, display, acct.puuid, acct.puuid);
@@ -193,8 +239,35 @@ async function getOrCreatePlayer(gameName, tagLine) {
   return { puuid: acct.puuid, summoner_id: acct.puuid, riot_display: display };
 }
 
+async function riotIdToPuuid(gameName, tagLine) {
+  const acct = await riotGet(
+    `${REGIONAL_HOST}/riot/account/v1/accounts/by-riot-id/${encodeURIComponent(gameName)}/${encodeURIComponent(tagLine)}`
+  );
+  return acct?.puuid || null;
+}
+
+function addRosterPlayerToDb(gameName, tagLine, puuid) {
+  const key = `${gameName}#${tagLine}`.toLowerCase();
+  const display = `${gameName}#${tagLine}`;
+  db.prepare(`
+    INSERT OR REPLACE INTO players (riot_id, riot_display, puuid, summoner_id)
+    VALUES (?, ?, ?, ?)
+  `).run(key, display, puuid, puuid);
+}
+
+function removeRosterPlayerFromDb(gameName, tagLine) {
+  const key = `${gameName}#${tagLine}`.toLowerCase();
+  db.prepare(`DELETE FROM players WHERE riot_id = ?`).run(key);
+}
+
+function listRosterFromDb() {
+  return db.prepare(`SELECT riot_display, puuid FROM players ORDER BY riot_display ASC`).all();
+}
+
+/* =========================================================
+   [SECTION] Live game detection
+   ========================================================= */
 async function getActiveGame(puuid) {
-  // Spectator v5 supports looking up current game by PUUID
   return riotGet(`${PLATFORM_HOST}/lol/spectator/v5/active-games/by-summoner/${puuid}`);
 }
 
@@ -208,6 +281,9 @@ function groupBy(arr, keyFn) {
   return m;
 }
 
+/* =========================================================
+   [SECTION] DB helpers (active + matches)
+   ========================================================= */
 function upsertActiveGame({ gameId, detectedAt, samplePuuid, teamId, stackSize }) {
   db.prepare(`
     INSERT OR REPLACE INTO active_games (game_id, detected_at, sample_puuid, team_id, stack_size)
@@ -230,12 +306,12 @@ function ensureStackMatchStarted({ gameId, startedAt, stackSize, queueId }) {
   `).run(String(gameId), startedAt, stackSize, queueId);
 }
 
-function finalizeStackMatch({ gameId, matchId, finishedAt, stackSize, win, queueId }) {
+function finalizeStackMatch({ gameId, matchId, finishedAt, stackSize, win, queueId, side }) {
   db.prepare(`
     UPDATE stack_matches
-    SET match_id = ?, finished_at = ?, stack_size = ?, win = ?, queue_id = ?
+    SET match_id = ?, finished_at = ?, stack_size = ?, win = ?, queue_id = ?, side = ?
     WHERE game_id = ?
-  `).run(matchId, finishedAt, stackSize, win, queueId, String(gameId));
+  `).run(matchId, finishedAt, stackSize, win, queueId, side || null, String(gameId));
 }
 
 function insertPlayerResults(matchId, results) {
@@ -249,12 +325,30 @@ function insertPlayerResults(matchId, results) {
   tx();
 }
 
-const DEFAULT_THRESHOLD = 3;
-const DEFAULT_POLL_MS = 60_000;
+// New for /stats: track “vs enemy champions” results per match
+function insertEnemyChampResults(matchId, enemyChamps, win) {
+  const stmt = db.prepare(`
+    INSERT OR IGNORE INTO enemy_champ_results (match_id, champ, win)
+    VALUES (?, ?, ?)
+  `);
 
+  const tx = db.transaction(() => {
+    for (const champ of enemyChamps) stmt.run(matchId, champ, win ? 1 : 0);
+  });
+
+  tx();
+}
+
+/* =========================================================
+   [SECTION] Config (DB-first, .env fallback)
+   ========================================================= */
 function getGlobalConfig() {
-  return db.prepare(`SELECT active_guild_id, poll_ms FROM global_config WHERE id = 1`).get()
-    || { active_guild_id: null, poll_ms: DEFAULT_POLL_MS };
+  return (
+    db.prepare(`SELECT active_guild_id, poll_ms FROM global_config WHERE id = 1`).get() || {
+      active_guild_id: null,
+      poll_ms: DEFAULT_POLL_MS,
+    }
+  );
 }
 
 function setGlobalConfigActiveGuild(guildId) {
@@ -266,7 +360,9 @@ function setGlobalPollMs(ms) {
 }
 
 function getGuildConfig(guildId) {
-  const row = db.prepare(`SELECT guild_id, alert_channel_id, threshold FROM guild_config WHERE guild_id = ?`).get(guildId);
+  const row = db
+    .prepare(`SELECT guild_id, alert_channel_id, threshold FROM guild_config WHERE guild_id = ?`)
+    .get(guildId);
   if (row) return row;
   return { guild_id: guildId, alert_channel_id: null, threshold: DEFAULT_THRESHOLD };
 }
@@ -298,6 +394,9 @@ function getEffectiveConfig() {
   return { activeGuildId, pollMs, threshold, alertChannelId };
 }
 
+/* =========================================================
+   [SECTION] Records
+   ========================================================= */
 function getTeamStackRecord() {
   const auto = db.prepare(`
     SELECT
@@ -317,27 +416,8 @@ function getTeamStackRecord() {
   return {
     auto: { wins: autoWins, losses: autoLosses },
     manual: { wins: manualWins, losses: manualLosses },
-    total: { wins: autoWins + manualWins, losses: autoLosses + manualLosses }
+    total: { wins: autoWins + manualWins, losses: autoLosses + manualLosses },
   };
-}
-
-function addRosterPlayerToDb(gameName, tagLine, puuid) {
-  const key = `${gameName}#${tagLine}`.toLowerCase();
-  const display = `${gameName}#${tagLine}`;
-  // summoner_id column exists from earlier schema; we store puuid there to satisfy NOT NULL
-  db.prepare(`
-    INSERT OR REPLACE INTO players (riot_id, riot_display, puuid, summoner_id)
-    VALUES (?, ?, ?, ?)
-  `).run(key, display, puuid, puuid);
-}
-
-function removeRosterPlayerFromDb(gameName, tagLine) {
-  const key = `${gameName}#${tagLine}`.toLowerCase();
-  db.prepare(`DELETE FROM players WHERE riot_id = ?`).run(key);
-}
-
-function listRosterFromDb() {
-  return db.prepare(`SELECT riot_display, puuid FROM players ORDER BY riot_display ASC`).all();
 }
 
 function setManualRecord(wins, losses) {
@@ -345,16 +425,15 @@ function setManualRecord(wins, losses) {
 }
 
 function addManualRecord(winsDelta, lossesDelta) {
-  db.prepare(`UPDATE manual_record SET wins = wins + ?, losses = losses + ? WHERE id = 1`).run(winsDelta, lossesDelta);
-}
-
-async function riotIdToPuuid(gameName, tagLine) {
-  const acct = await riotGet(
-    `${REGIONAL_HOST}/riot/account/v1/accounts/by-riot-id/${encodeURIComponent(gameName)}/${encodeURIComponent(tagLine)}`
+  db.prepare(`UPDATE manual_record SET wins = wins + ?, losses = losses + ? WHERE id = 1`).run(
+    winsDelta,
+    lossesDelta
   );
-  return acct?.puuid || null;
 }
 
+/* =========================================================
+   [SECTION] Match completion helpers
+   ========================================================= */
 async function fetchCompletedMatchForGameId(samplePuuid, gameId) {
   const ids = await riotGet(
     `${REGIONAL_HOST}/lol/match/v5/matches/by-puuid/${samplePuuid}/ids?start=0&count=15`
@@ -370,135 +449,169 @@ async function fetchCompletedMatchForGameId(samplePuuid, gameId) {
 }
 
 function didTeamWin(match, teamId) {
-  const t = match.info.teams.find(x => x.teamId === teamId);
+  const t = match.info.teams.find((x) => x.teamId === teamId);
   return !!t?.win;
-}
-
-async function postEmbed(client, embed) {
-  const { alertChannelId } = getEffectiveConfig();
-  if (!alertChannelId) throw new Error("No alert channel configured (set ALERT_CHANNEL_ID in .env or /config set alert-channel)");
-
-  const channel = await client.channels.fetch(alertChannelId);
-  if (!channel?.isTextBased()) throw new Error("Configured alert channel is not a text channel");
-  await channel.send({ embeds: [embed] });
 }
 
 function hasStackMatchRow(gameId) {
   return !!db.prepare("SELECT game_id FROM stack_matches WHERE game_id = ?").get(String(gameId));
 }
 
-// Discord client
+/* =========================================================
+   [SECTION] Discord posting helpers
+   ========================================================= */
+async function postEmbed(client, embed) {
+  const { alertChannelId } = getEffectiveConfig();
+  if (!alertChannelId)
+    throw new Error(
+      "No alert channel configured (set ALERT_CHANNEL_ID in .env or /config set alert-channel)"
+    );
+
+  const channel = await client.channels.fetch(alertChannelId);
+  if (!channel?.isTextBased()) throw new Error("Configured alert channel is not a text channel");
+  await channel.send({ embeds: [embed] });
+}
+
+async function postEmbeds(client, embeds) {
+  const { alertChannelId } = getEffectiveConfig();
+  if (!alertChannelId)
+    throw new Error(
+      "No alert channel configured (set ALERT_CHANNEL_ID in .env or /config set alert-channel)"
+    );
+
+  const channel = await client.channels.fetch(alertChannelId);
+  if (!channel?.isTextBased()) throw new Error("Configured alert channel is not a text channel");
+  await channel.send({ embeds });
+}
+
+/* =========================================================
+   [SECTION] Discord client + command loader
+   ========================================================= */
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-// Load command modules
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const commands = new Map();
 
-// Interaction Handler
-client.on('interactionCreate', async (interaction) => {
+client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
   const cmd = commands.get(interaction.commandName);
   if (!cmd) return;
 
+  // Context passed to every command module
   const ctx = {
+    db, // <-- REQUIRED for /stats
     pollOnce,
     getTeamStackRecord,
+
     // roster helpers
     riotIdToPuuid,
     addRosterPlayerToDb,
     removeRosterPlayerFromDb,
     listRosterFromDb,
-    // ...existing
-    canEditRecord,
-    opggSummonerUrl,
+
+    // config helpers
     getGlobalConfig,
     setGlobalConfigActiveGuild,
     setGlobalPollMs,
     getGuildConfig,
     upsertGuildConfig,
     getEffectiveConfig,
+
+    // misc
+    canEditRecord,
+    opggSummonerUrl,
+
     // manual record helpers
     addManualRecord,
     setManualRecord,
+
+    // status helpers
     getLastPollStartedAt: () => lastPollStartedAt,
     getLastPollFinishedAt: () => lastPollFinishedAt,
     getLastPollError: () => lastPollError,
-
   };
 
   try {
+    if (interaction.commandName === "stats") console.log("[debug] stats ctx keys:", Object.keys(ctx));
     await cmd.execute(interaction, ctx);
   } catch (e) {
-    console.error('Command error:', e);
+    console.error("Command error:", e);
     if (interaction.replied || interaction.deferred) {
-      await interaction.followUp({ content: 'Command failed.', ephemeral: true });
+      await interaction.followUp({ content: "Command failed.", ephemeral: true });
     } else {
-      await interaction.reply({ content: 'Command failed.', ephemeral: true });
+      await interaction.reply({ content: "Command failed.", ephemeral: true });
     }
   }
 });
 
-const commandsDir = path.join(__dirname, 'commands');
+// Load all ./commands/*.js
+const commandsDir = path.join(__dirname, "commands");
 if (fs.existsSync(commandsDir)) {
-  for (const file of fs.readdirSync(commandsDir).filter(f => f.endsWith('.js'))) {
-
+  for (const file of fs.readdirSync(commandsDir).filter((f) => f.endsWith(".js"))) {
     const fullPath = path.join(commandsDir, file);
     const cmd = await import(pathToFileURL(fullPath).href);
-
     commands.set(cmd.data.name, cmd);
   }
 }
 
+/* =========================================================
+   [SECTION] Startup + polling loop
+   ========================================================= */
 client.once("clientReady", async () => {
   console.log(`Logged in as ${client.user.tag}`);
 
-  // Optional local roster seeding (server-only)
-const localRoster = loadLocalRoster();
-
-if (localRoster.length > 0) {
-  console.log(`Seeding roster from roster.local.json (${localRoster.length} players)`);
-
-  for (const p of localRoster) {
-    try {
-      const row = await getOrCreatePlayer(p.gameName, p.tagLine);
-      console.log(`Roster OK: ${row.riot_display}`);
-    } catch (e) {
-      console.error(`Roster failed for ${p.gameName}#${p.tagLine}: ${e.message}`);
+  // Seed roster from roster.local.json if present
+  const localRoster = loadLocalRoster();
+  if (localRoster.length > 0) {
+    console.log(`Seeding roster from roster.local.json (${localRoster.length} players)`);
+    for (const p of localRoster) {
+      try {
+        const row = await getOrCreatePlayer(p.gameName, p.tagLine);
+        console.log(`Roster OK: ${row.riot_display}`);
+      } catch (e) {
+        console.error(`Roster failed for ${p.gameName}#${p.tagLine}: ${e.message}`);
+      }
     }
   }
-}
 
-   // Main loop (dynamic poll interval)
+  // Poll loop
   const loop = async () => {
-  while (true) {
-    lastPollStartedAt = Date.now();
-    lastPollError = null;
+    while (true) {
+      lastPollStartedAt = Date.now();
+      lastPollError = null;
 
-    try {
-      await pollOnce();
-      lastPollFinishedAt = Date.now();
-    } catch (e) {
-      lastPollError = e?.message || String(e);
-      console.error("Poll error:", lastPollError);
+      try {
+        await pollOnce();
+        lastPollFinishedAt = Date.now();
+      } catch (e) {
+        lastPollError = e?.message || String(e);
+        console.error("Poll error:", lastPollError);
+      }
+
+      const { pollMs } = getEffectiveConfig();
+      await new Promise((resolve) => setTimeout(resolve, pollMs));
     }
-
-    const { pollMs } = getEffectiveConfig();
-    await new Promise(resolve => setTimeout(resolve, pollMs));
-  }
-};
+  };
 
   loop(); // do NOT await
 });
 
+/* =========================================================
+   [SECTION] Core logic: pollOnce()
+   - detects live stacks
+   - tracks completion
+   - posts final embeds
+   - writes stats for /stats
+   ========================================================= */
 async function pollOnce() {
-  // Roster from DB
   console.log(`[poll] ${new Date().toLocaleTimeString()} checking roster...`);
+
   const rosterRows = db.prepare("SELECT riot_display, puuid, summoner_id FROM players").all();
   if (rosterRows.length === 0) return;
 
-  // Live flex participants among roster
+  // ----- Live flex participants among roster -----
   const liveFlex = [];
 
   for (const r of rosterRows) {
@@ -506,36 +619,32 @@ async function pollOnce() {
     if (!game) continue;
     if (game.gameQueueConfigId !== FLEX_QUEUE_ID) continue;
 
-    const me = game.participants.find(p => p.puuid === r.puuid);
+    const me = game.participants.find((p) => p.puuid === r.puuid);
     if (!me) continue;
-
 
     liveFlex.push({
       riot_display: r.riot_display,
       puuid: r.puuid,
       gameId: game.gameId,
-      teamId: me.teamId
+      teamId: me.teamId,
     });
   }
 
-  // Find stacks (same gameId, same teamId)
-  const byGame = groupBy(liveFlex, x => x.gameId);
+  // ----- Find stacks (same gameId, same teamId) -----
+  const byGame = groupBy(liveFlex, (x) => x.gameId);
 
   for (const [gameId, playersInGame] of byGame.entries()) {
-    const byTeam = groupBy(playersInGame, x => x.teamId);
+    const byTeam = groupBy(playersInGame, (x) => x.teamId);
 
     for (const [teamId, stack] of byTeam.entries()) {
       const { threshold } = getEffectiveConfig();
-    if (stack.length < threshold) continue;
-
+      if (stack.length < threshold) continue;
 
       const detectedAt = Date.now();
 
       // Announce once
       if (!hasStackMatchRow(gameId)) {
-        const opggLines = stack.map(
-          s => `• [${s.riot_display}](${opggSummonerUrl(s.riot_display)})`
-        );
+        const opggLines = stack.map((s) => `• [${s.riot_display}](${opggSummonerUrl(s.riot_display)})`);
         const started = new EmbedBuilder()
           .setTitle(`Flex stack detected (${stack.length})`)
           .setDescription(opggLines.join("\n"))
@@ -548,31 +657,30 @@ async function pollOnce() {
         await postEmbed(client, started);
       }
 
-
-      // Watch it for completion + persist start
+      // Persist active game + start row
       upsertActiveGame({
         gameId,
         detectedAt,
         samplePuuid: stack[0].puuid,
         teamId: Number(teamId),
-        stackSize: stack.length
+        stackSize: stack.length,
       });
 
       ensureStackMatchStarted({
         gameId,
         startedAt: detectedAt,
         stackSize: stack.length,
-        queueId: FLEX_QUEUE_ID
+        queueId: FLEX_QUEUE_ID,
       });
     }
   }
 
-  // Check active games for completion and post results
+  // ----- Check active games for completion -----
   const active = getActiveGames();
   if (active.length === 0) return;
 
-  const puuidToDisplay = new Map(rosterRows.map(r => [r.puuid, r.riot_display]));
-  const rosterPuuids = new Set(rosterRows.map(r => r.puuid));
+  const puuidToDisplay = new Map(rosterRows.map((r) => [r.puuid, r.riot_display]));
+  const rosterPuuids = new Set(rosterRows.map((r) => r.puuid));
 
   for (const row of active) {
     const done = await fetchCompletedMatchForGameId(row.sample_puuid, row.game_id);
@@ -582,12 +690,16 @@ async function pollOnce() {
     const teamId = Number(row.team_id);
     const win = didTeamWin(match, teamId) ? 1 : 0;
 
+    // Side: teamId 100 = BLUE, teamId 200 = RED
+    const side = teamId === 100 ? "BLUE" : teamId === 200 ? "RED" : null;
+
+    // Store player results
     const rosterTeamParticipants = match.info.participants
-      .filter(p => rosterPuuids.has(p.puuid) && p.teamId === teamId)
-      .map(p => ({
+      .filter((p) => rosterPuuids.has(p.puuid) && p.teamId === teamId)
+      .map((p) => ({
         puuid: p.puuid,
         riot_display: puuidToDisplay.get(p.puuid) || p.summonerName,
-        win
+        win,
       }));
 
     finalizeStackMatch({
@@ -596,16 +708,23 @@ async function pollOnce() {
       finishedAt: Date.now(),
       stackSize: row.stack_size,
       win,
-      queueId: FLEX_QUEUE_ID
+      queueId: FLEX_QUEUE_ID,
+      side,
     });
 
     insertPlayerResults(matchId, rosterTeamParticipants);
 
+    // NEW: track enemy champs for /stats
+    const enemyChamps = match.info.participants
+      .filter((p) => p.teamId !== teamId)
+      .map((p) => p.championName);
+    insertEnemyChampResults(matchId, enemyChamps, win);
+
+    // ----- Build and post embeds -----
     const record = getTeamStackRecord();
     const wins = record.total.wins;
     const losses = record.total.losses;
 
-    // Summary embed (match-level)
     const summary = new EmbedBuilder()
       .setTitle(`Flex stack finished: ${win ? "WIN" : "LOSS"}`)
       .addFields(
@@ -615,17 +734,15 @@ async function pollOnce() {
       )
       .setTimestamp();
 
-    // One embed per roster player (champ icon thumbnail)
     const ddragonVersion = await getDdragonVersion();
 
     const playerEmbeds = match.info.participants
-      .filter(p => rosterPuuids.has(p.puuid) && p.teamId === teamId)
-      .map(p => {
+      .filter((p) => rosterPuuids.has(p.puuid) && p.teamId === teamId)
+      .map((p) => {
         const riotDisplay = puuidToDisplay.get(p.puuid) || p.summonerName;
         const opgg = opggSummonerUrl(riotDisplay);
 
-        const champIconUrl =
-          `https://ddragon.leagueoflegends.com/cdn/${ddragonVersion}/img/champion/${p.championName}.png`;
+        const champIconUrl = `https://ddragon.leagueoflegends.com/cdn/${ddragonVersion}/img/champion/${p.championName}.png`;
 
         return new EmbedBuilder()
           .setTitle(riotDisplay)
@@ -639,16 +756,7 @@ async function pollOnce() {
 
     await postEmbeds(client, [summary, ...playerEmbeds]);
 
-    async function postEmbeds(client, embeds) {
-  const { alertChannelId } = getEffectiveConfig();
-  if (!alertChannelId) throw new Error("No alert channel configured (set ALERT_CHANNEL_ID in .env or /config set-alert-channel)");
-
-  const channel = await client.channels.fetch(alertChannelId);
-  if (!channel?.isTextBased()) throw new Error("Configured alert channel is not a text channel");
-  await channel.send({ embeds });
-}
-
-
+    // Cleanup
     removeActiveGame(row.game_id);
   }
 }
