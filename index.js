@@ -193,6 +193,27 @@ function ensureMigrations() {
     CREATE INDEX IF NOT EXISTS idx_team_champ_results_champ
     ON team_champ_results(champ);
   `);
+
+    // --- GitHub release notifier migrations ---
+  // Add updates_channel_id to guild_config
+  try {
+    db.exec(`ALTER TABLE guild_config ADD COLUMN updates_channel_id TEXT`);
+    console.log("[db] Migration: added guild_config.updates_channel_id");
+  } catch (e) {
+    if (!String(e.message).includes("duplicate column name")) {
+      console.warn("[db] Migration warning:", e.message);
+    }
+  }
+
+  // Persist last posted release tag so we don't repost on restart
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS github_state (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      last_release_tag TEXT
+    );
+  `);
+
+  db.exec(`INSERT OR IGNORE INTO github_state (id, last_release_tag) VALUES (1, NULL);`);
 }
 
 ensureMigrations();
@@ -425,20 +446,28 @@ function setGlobalPollMs(ms) {
 
 function getGuildConfig(guildId) {
   const row = db
-    .prepare(`SELECT guild_id, alert_channel_id, threshold FROM guild_config WHERE guild_id = ?`)
+    .prepare(`SELECT guild_id, alert_channel_id, threshold, updates_channel_id FROM guild_config WHERE guild_id = ?`)
     .get(guildId);
+
   if (row) return row;
-  return { guild_id: guildId, alert_channel_id: null, threshold: DEFAULT_THRESHOLD };
+
+  return {
+    guild_id: guildId,
+    alert_channel_id: null,
+    threshold: DEFAULT_THRESHOLD,
+    updates_channel_id: null
+  };
 }
 
-function upsertGuildConfig({ guildId, alertChannelId = null, threshold = DEFAULT_THRESHOLD }) {
+function upsertGuildConfig({ guildId, alertChannelId = null, threshold = null, updatesChannelId = null }) {
   db.prepare(`
-    INSERT INTO guild_config (guild_id, alert_channel_id, threshold)
-    VALUES (?, ?, ?)
+    INSERT INTO guild_config (guild_id, alert_channel_id, threshold, updates_channel_id)
+    VALUES (?, ?, COALESCE(?, ?), ?)
     ON CONFLICT(guild_id) DO UPDATE SET
       alert_channel_id = COALESCE(excluded.alert_channel_id, guild_config.alert_channel_id),
-      threshold = COALESCE(excluded.threshold, guild_config.threshold)
-  `).run(guildId, alertChannelId, threshold);
+      threshold = COALESCE(excluded.threshold, guild_config.threshold),
+      updates_channel_id = COALESCE(excluded.updates_channel_id, guild_config.updates_channel_id)
+  `).run(guildId, alertChannelId, threshold, DEFAULT_THRESHOLD, updatesChannelId);
 }
 
 function getEffectiveConfig() {
@@ -448,14 +477,16 @@ function getEffectiveConfig() {
 
   let threshold = DEFAULT_THRESHOLD;
   let alertChannelId = process.env.ALERT_CHANNEL_ID || null;
+  let updatesChannelId = process.env.GITHUB_RELEASE_CHANNEL_ID || null; // optional fallback
 
   if (activeGuildId) {
     const gc = getGuildConfig(activeGuildId);
     threshold = gc.threshold ?? DEFAULT_THRESHOLD;
     alertChannelId = gc.alert_channel_id || alertChannelId;
+    updatesChannelId = gc.updates_channel_id || updatesChannelId;
   }
 
-  return { activeGuildId, pollMs, threshold, alertChannelId };
+  return { activeGuildId, pollMs, threshold, alertChannelId, updatesChannelId };
 }
 
 /* =========================================================
@@ -527,6 +558,16 @@ function getSideFromTeamId(teamId) {
   return null;
 }
 
+function padRight(str, len) {
+  str = String(str ?? "");
+  return str.length >= len ? str.slice(0, len - 1) + "…" : str.padEnd(len, " ");
+}
+
+function padLeft(str, len) {
+  str = String(str ?? "");
+  return str.length >= len ? str.slice(0, len) : str.padStart(len, " ");
+}
+
 function hasStackMatchRow(gameId) {
   return !!db.prepare("SELECT game_id FROM stack_matches WHERE game_id = ?").get(String(gameId));
 }
@@ -556,6 +597,16 @@ async function postEmbeds(client, embeds) {
   const channel = await client.channels.fetch(alertChannelId);
   if (!channel?.isTextBased()) throw new Error("Configured alert channel is not a text channel");
   await channel.send({ embeds });
+}
+
+async function postUpdateEmbed(client, embed) {
+  const { updatesChannelId } = getEffectiveConfig();
+  if (!updatesChannelId) return; // silently do nothing if not configured
+
+  const channel = await client.channels.fetch(updatesChannelId);
+  if (!channel?.isTextBased()) return;
+
+  await channel.send({ embeds: [embed] });
 }
 
 /* =========================================================
@@ -629,6 +680,78 @@ if (fs.existsSync(commandsDir)) {
   }
 }
 
+function getLastPostedReleaseTag() {
+  const row = db.prepare(`SELECT last_release_tag FROM github_state WHERE id = 1`).get();
+  return row?.last_release_tag || null;
+}
+
+function setLastPostedReleaseTag(tag) {
+  db.prepare(`UPDATE github_state SET last_release_tag = ? WHERE id = 1`).run(tag);
+}
+
+async function fetchLatestGithubRelease() {
+  const owner = process.env.GITHUB_OWNER;
+  const repo = process.env.GITHUB_REPO;
+  if (!owner || !repo) return null;
+
+  const url = `https://api.github.com/repos/${owner}/${repo}/releases/latest`;
+
+  const res = await request(url, {
+    headers: {
+      "User-Agent": "flextrackerbot",
+      "Accept": "application/vnd.github+json"
+    }
+  });
+
+  if (res.statusCode === 404) return null; // no releases yet
+  if (res.statusCode < 200 || res.statusCode >= 300) {
+    const txt = await res.body.text();
+    throw new Error(`GitHub release check failed ${res.statusCode}: ${txt}`);
+  }
+
+  return res.body.json();
+}
+
+function truncate(str, max = 900) {
+  str = String(str ?? "");
+  return str.length > max ? str.slice(0, max - 1) + "…" : str;
+}
+
+async function githubReleaseWatcher(client) {
+  const checkMs = Number(process.env.GITHUB_CHECK_MS || 21_600_000); // 6 hours default
+
+  while (true) {
+    try {
+      const release = await fetchLatestGithubRelease();
+
+      if (release?.tag_name) {
+        const lastTag = getLastPostedReleaseTag();
+        const newTag = release.tag_name;
+
+        if (newTag !== lastTag) {
+          const notes = truncate(release.body || "(No release notes provided.)");
+
+          const embed = new EmbedBuilder()
+            .setTitle(`Flex Tracker updated: ${newTag}`)
+            .setDescription(notes)
+            .addFields(
+              { name: "Repo", value: `${process.env.GITHUB_OWNER}/${process.env.GITHUB_REPO}`, inline: true }
+            )
+            .setTimestamp(new Date(release.published_at || Date.now()));
+
+          await postUpdateEmbed(client, embed);
+          setLastPostedReleaseTag(newTag);
+          console.log(`[github] Posted new release: ${newTag}`);
+        }
+      }
+    } catch (e) {
+      console.warn("[github] Release watcher warning:", e.message);
+    }
+
+    await new Promise((r) => setTimeout(r, checkMs));
+  }
+}
+
 /* =========================================================
    [SECTION] Startup + polling loop
    ========================================================= */
@@ -646,6 +769,8 @@ client.once("clientReady", async () => {
       } catch (e) {
         console.error(`Roster failed for ${p.gameName}#${p.tagLine}: ${e.message}`);
       }
+        // Start GitHub release watcher (posts to bot-updates channel if configured)
+  githubReleaseWatcher(client); // do NOT await
     }
   }
 
@@ -805,41 +930,90 @@ async function pollOnce() {
       .map((p) => p.championName);
     insertEnemyChampResults(matchId, enemyChamps, win);
 
-    // ----- Build and post embeds -----
-    const record = getTeamStackRecord();
-    const wins = record.total.wins;
-    const losses = record.total.losses;
+// ----- Build and post embeds -----
+const record = getTeamStackRecord();
+const wins = record.total.wins;
+const losses = record.total.losses;
 
-    const summary = new EmbedBuilder()
-      .setTitle(`Flex stack finished: ${win ? "WIN" : "LOSS"}`)
+// Basic match header (keep yours)
+const summary = new EmbedBuilder()
+  .setTitle(`Flex stack finished: ${win ? "WIN" : "LOSS"}`)
+  .addFields(
+    { name: "Stack size", value: String(row.stack_size), inline: true },
+    { name: "All-time stack record", value: `${wins}-${losses}`, inline: true },
+    { name: "Match ID", value: matchId, inline: false }
+  )
+  .setTimestamp();
+
+// Build scoreboard rows (table-like)
+const teamPlayers = match.info.participants
+  .filter((p) => rosterPuuids.has(p.puuid) && p.teamId === teamId)
+  .map((p) => {
+    const riotDisplay = puuidToDisplay.get(p.puuid) || p.summonerName;
+    return {
+      name: riotDisplay,
+      champ: p.championName,
+      k: p.kills,
+      d: p.deaths,
+      a: p.assists,
+      cs: p.totalMinionsKilled + (p.neutralMinionsKilled || 0),
+      gold: p.goldEarned,
+    };
+  });
+
+// Sort by gold desc (feels "scoreboard-ish")
+teamPlayers.sort((a, b) => (b.gold || 0) - (a.gold || 0));
+
+// Column widths (tweak if you want)
+const NAME_W = 18;
+const CHAMP_W = 12;
+
+const header =
+  `${padRight("Player", NAME_W)} ` +
+  `${padRight("Champ", CHAMP_W)} ` +
+  `${padLeft("K/D/A", 7)} ` +
+  `${padLeft("CS", 4)} ` +
+  `${padLeft("Gold", 5)}`;
+
+const rows = teamPlayers.map((r) => {
+  const kda = `${r.k}/${r.d}/${r.a}`;
+  const goldK = Math.round((r.gold || 0) / 1000); // 12 => 12k (quick + readable)
+  return (
+    `${padRight(r.name, NAME_W)} ` +
+    `${padRight(r.champ, CHAMP_W)} ` +
+    `${padLeft(kda, 7)} ` +
+    `${padLeft(r.cs ?? 0, 4)} ` +
+    `${padLeft(`${goldK}k`, 5)}`
+  );
+});
+
+const scoreboard = new EmbedBuilder()
+  .setTitle(`Scoreboard (${getSideFromTeamId(teamId) || "TEAM"})`)
+  .setDescription("```" + [header, ...rows].join("\n") + "```");
+
+// Per-player embeds (champ icon + link + KDA)
+const ddragonVersion = await getDdragonVersion();
+
+const playerEmbeds = match.info.participants
+  .filter((p) => rosterPuuids.has(p.puuid) && p.teamId === teamId)
+  .map((p) => {
+    const riotDisplay = puuidToDisplay.get(p.puuid) || p.summonerName;
+    const opgg = opggSummonerUrl(riotDisplay);
+
+    const champIconUrl = `https://ddragon.leagueoflegends.com/cdn/${ddragonVersion}/img/champion/${p.championName}.png`;
+
+    return new EmbedBuilder()
+      .setTitle(riotDisplay)
+      .setURL(opgg)
+      .setThumbnail(champIconUrl)
       .addFields(
-        { name: "Stack size", value: String(row.stack_size), inline: true },
-        { name: "All-time stack record", value: `${wins}-${losses}`, inline: true },
-        { name: "Match ID", value: matchId, inline: false }
-      )
-      .setTimestamp();
+        { name: "Champion", value: p.championName, inline: true },
+        { name: "K/D/A", value: `${p.kills}/${p.deaths}/${p.assists}`, inline: true }
+      );
+  });
 
-    const ddragonVersion = await getDdragonVersion();
-
-    const playerEmbeds = match.info.participants
-      .filter((p) => rosterPuuids.has(p.puuid) && p.teamId === teamId)
-      .map((p) => {
-        const riotDisplay = puuidToDisplay.get(p.puuid) || p.summonerName;
-        const opgg = opggSummonerUrl(riotDisplay);
-
-        const champIconUrl = `https://ddragon.leagueoflegends.com/cdn/${ddragonVersion}/img/champion/${p.championName}.png`;
-
-        return new EmbedBuilder()
-          .setTitle(riotDisplay)
-          .setURL(opgg)
-          .setThumbnail(champIconUrl)
-          .addFields(
-            { name: "Champion", value: p.championName, inline: true },
-            { name: "K/D/A", value: `${p.kills}/${p.deaths}/${p.assists}`, inline: true }
-          );
-      });
-
-    await postEmbeds(client, [summary, ...playerEmbeds]);
+// ONE message, multiple embeds (summary + scoreboard + players)
+await postEmbeds(client, [summary, scoreboard, ...playerEmbeds]);
 
     // Cleanup
     removeActiveGame(row.game_id);
